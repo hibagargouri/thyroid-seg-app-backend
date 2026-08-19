@@ -12,6 +12,7 @@
 # =============================================================
 
 import os
+import gc
 import urllib.request
 import math
 import io
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse
 from diffusers import DDPMScheduler
 
 DEVICE = "cpu"  # Render's free tier is CPU-only
+torch.set_num_threads(1)  # reduces memory overhead on a constrained free instance
 RESOLUTION = 256
 INFERENCE_STEPS = 60  # reduced from 1000 for response time on free CPU hardware
 
@@ -172,23 +174,20 @@ class GenUNet(nn.Module):
 # ---------------------------------------------------------------
 # Load models once at startup
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Models are loaded ON DEMAND inside each endpoint (not kept
+# permanently in memory) — the free Render tier only has 512MB RAM,
+# and keeping both models loaded at once exceeded that. Loading one
+# at a time, and freeing it right after use, keeps peak memory low
+# at the cost of a bit of extra loading time per request.
+# ---------------------------------------------------------------
 app = FastAPI(title="Thyroid Data Augmentation API")
-
-print("Loading segmentation model...")
-seg_model = SegUNet().to(DEVICE)
-seg_model.load_state_dict(torch.load(SEG_CKPT, map_location=DEVICE))
-seg_model.eval()
-
-print("Loading generation model...")
-gen_model = GenUNet(in_ch=2, out_ch=1).to(DEVICE)
-gen_model.load_state_dict(torch.load(GEN_CKPT, map_location=DEVICE))
-gen_model.eval()
 
 scheduler = DDPMScheduler(
     num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2",
     clip_sample=True, clip_sample_range=1.0, prediction_type="epsilon",
 )
-print("Models loaded — ready.")
+print("Ready (models load on demand per request to save memory).")
 
 
 # ---------------------------------------------------------------
@@ -243,8 +242,15 @@ async def detect_mask(file: UploadFile = File(...)):
     pil_img = Image.open(io.BytesIO(image_bytes))
     img = preprocess(pil_img)
     x = to_tensor_image(img).to(DEVICE)
+
+    seg_model = SegUNet().to(DEVICE)
+    seg_model.load_state_dict(torch.load(SEG_CKPT, map_location=DEVICE))
+    seg_model.eval()
     with torch.no_grad():
         pred = torch.sigmoid(seg_model(x))
+    del seg_model
+    gc.collect()
+
     mask_arr = (pred[0, 0].numpy() > 0.5).astype(np.uint8) * 255
     mask_pil = Image.fromarray(mask_arr, mode="L")
     return JSONResponse({
@@ -263,6 +269,10 @@ async def generate(mask_base64: str = Form(...), num_variants: int = Form(1)):
     n = max(1, min(int(num_variants), 5))  # cap at 5 to protect free-tier resources
     masks_batch = mask_t.repeat(n, 1, 1, 1)
 
+    gen_model = GenUNet(in_ch=2, out_ch=1).to(DEVICE)
+    gen_model.load_state_dict(torch.load(GEN_CKPT, map_location=DEVICE))
+    gen_model.eval()
+
     scheduler.set_timesteps(INFERENCE_STEPS)
     with torch.no_grad():
         image = torch.randn(n, 1, RESOLUTION, RESOLUTION, device=DEVICE)
@@ -272,6 +282,9 @@ async def generate(mask_base64: str = Form(...), num_variants: int = Form(1)):
             pred_noise = gen_model(model_input, t_batch)
             image = scheduler.step(pred_noise, t, image).prev_sample
         image = image.clamp(-1, 1)
+
+    del gen_model
+    gc.collect()
 
     results_base64 = [tensor_to_base64(image[i:i+1]) for i in range(n)]
     return JSONResponse({"variants_base64": results_base64})
