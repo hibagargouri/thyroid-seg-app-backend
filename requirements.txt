@@ -3,7 +3,6 @@ torch
 --index-url https://pypi.org/simple
 fastapi
 uvicorn[standard]
-diffusers
 pillow
 numpy
 python-multipart
