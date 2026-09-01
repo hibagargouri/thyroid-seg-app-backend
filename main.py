@@ -124,13 +124,30 @@ def health_check():
 def detect_mask(file: UploadFile = File(...)):
     image_bytes = file.file.read()
     pil_img = Image.open(io.BytesIO(image_bytes))
+
+    # Basic heuristic: real ultrasounds are grayscale (R≈G≈B everywhere).
+    # A photo with real color content (a foot, a face, a random picture)
+    # will have much more difference between channels. This is NOT a
+    # robust classifier — just a lightweight safety check.
+    rgb_img = pil_img.convert("RGB")
+    rgb_arr = np.asarray(rgb_img).astype(np.float32)
+    channel_diff = np.mean(np.abs(rgb_arr[:, :, 0] - rgb_arr[:, :, 1])) + \
+                   np.mean(np.abs(rgb_arr[:, :, 1] - rgb_arr[:, :, 2]))
+    likely_not_ultrasound = bool(channel_diff > 12)
+
     img = preprocess(pil_img)
     x = to_tensor_image(img).to(DEVICE)
     with torch.no_grad():
         pred = torch.sigmoid(seg_model(x))
     mask_arr = (pred[0, 0].numpy() > 0.5).astype(np.uint8) * 255
     mask_pil = Image.fromarray(mask_arr, mode="L")
+
+    nodule_pixel_fraction = float((mask_arr > 0).mean())
+    nodule_detected = nodule_pixel_fraction > 0.002  # more than ~0.2% of pixels
+
     return JSONResponse({
         "preprocessed_image_base64": pil_to_base64(img),
         "mask_base64": pil_to_base64(mask_pil),
+        "likely_not_ultrasound": likely_not_ultrasound,
+        "nodule_detected": nodule_detected,
     })
